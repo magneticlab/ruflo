@@ -191,6 +191,33 @@ grep -q "execCli(\[\s*'-y'\s*,\s*'metaharness@latest'" "$F" 2>/dev/null || \
 grep -q "cwd: opts" "$F" || miss="$miss no-cwd-passthrough"
 [[ -z "$miss" ]] && ok || bad "$miss"
 
+step "17t. .harness/mcp-policy.json present + default-deny (iter 30 — closes no-policy HIGH)"
+F="$ROOT/../../.harness/mcp-policy.json"
+miss=""
+[[ -f "$F" ]] || miss="$miss missing-policy-file"
+node -e "JSON.parse(require('fs').readFileSync('$F','utf-8'))" 2>/dev/null || miss="$miss invalid-json"
+# Required fields per metaharness mcp-scan source
+node -e "
+const j = JSON.parse(require('fs').readFileSync('$F','utf-8'));
+const must = { defaultDeny: true, auditLog: true, requireApprovalForDangerous: true };
+for (const [k, v] of Object.entries(must)) {
+  if (j[k] !== v) { console.error('missing or wrong:', k, '=', j[k]); process.exit(1); }
+}
+// toolTimeoutMs must be positive
+if (!Number.isFinite(j.toolTimeoutMs) || j.toolTimeoutMs <= 0) {
+  console.error('toolTimeoutMs not positive'); process.exit(1);
+}
+// maxToolCallsPerTurn must be positive (clears 'no-call-budget' finding)
+if (!Number.isFinite(j.maxToolCallsPerTurn) || j.maxToolCallsPerTurn <= 0) {
+  console.error('maxToolCallsPerTurn not positive'); process.exit(1);
+}
+// ADR-150 anchor present
+if (!JSON.stringify(j).includes('ADR-150')) {
+  console.error('no ADR-150 anchor in policy'); process.exit(1);
+}
+" 2>/dev/null || miss="$miss policy-shape-invalid"
+[[ -z "$miss" ]] && ok || bad "$miss"
+
 step "17s. mint.mjs cwd-based scaffolding (iter 27 fix for upstream --target bug)"
 F="$ROOT/scripts/mint.mjs"
 miss=""
