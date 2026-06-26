@@ -32,7 +32,7 @@ const RUNS_DIR = join(RUFLO_ROOT, 'docs', 'benchmarks', 'runs');
 const DATA_DIR = process.env.BEIR_DATA_DIR || '/tmp/beir-nfcorpus/nfcorpus';
 const BGE_MODEL = process.env.BGE_MODEL || 'Xenova/bge-base-en-v1.5';
 const CACHE_DIR = join(process.env.CACHE_BASE_DIR || dirname(DATA_DIR), 'bge-cache');
-const RRF_K = Number(process.env.RRF_K) || 60;
+const RRF_K_DEFAULT = Number(process.env.RRF_K) || 60;
 const RERANK = process.env.RERANK === '1';
 const RERANK_TOP_K = Number(process.env.RERANK_TOP_K) || 100;
 const MAX_QUERIES = Number(process.env.MAX_QUERIES) || 0;
@@ -55,6 +55,8 @@ function ndcg(retrieved, qrels, k) { const rels = retrieved.slice(0, k).map((id)
 function mrr(retrieved, qrels, k) { for (let i = 0; i < Math.min(retrieved.length, k); i++) if ((qrels.get(retrieved[i]) ?? 0) > 0) return 1 / (i + 1); return 0; }
 function recall(retrieved, qrels, k) { const tot = [...qrels.values()].filter((v) => v > 0).length; if (tot === 0) return 0; let h = 0; for (let i = 0; i < Math.min(retrieved.length, k); i++) if ((qrels.get(retrieved[i]) ?? 0) > 0) h++; return h / tot; }
 function cosine(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; }
+function adaptiveRrfK(corpusSize) { return corpusSize < 20000 ? 40 : 60; }  // tighter weighting for small corpora
+function minMaxNorm(scores) { const [min, max] = [Math.min(...scores), Math.max(...scores)]; return scores.map((s) => max === min ? 0.5 : (s - min) / (max - min)); }
 
 function loadJsonl(path) { return readFileSync(path, 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); }
 function loadQrels(path) { const q = new Map(); const lines = readFileSync(path, 'utf-8').split('\n'); for (let i = 1; i < lines.length; i++) { if (!lines[i].trim()) continue; const [qid, did, score] = lines[i].split('\t'); if (!q.has(qid)) q.set(qid, new Map()); q.get(qid).set(did, Number(score)); } return q; }
@@ -73,12 +75,14 @@ function loadEmbeddings(dim) {
 async function main() {
   const dataset = detectDataset(DATA_DIR);
   const BASELINES_NDCG10 = BASELINES_BY_DATASET[dataset];
-  console.log(`# BEIR ${dataset} — hybrid RRF${RERANK ? ' + cross-encoder rerank' : ''} (ADR-087)`);
+  const corpus = loadJsonl(join(DATA_DIR, 'corpus.jsonl'));
+  const RRF_K = adaptiveRrfK(corpus.length);  // adaptive k based on corpus size (iter 1: normalize scores + tighter k for small corpora)
+
+  console.log(`# BEIR ${dataset} — hybrid RRF${RERANK ? ' + cross-encoder rerank' : ''} (ADR-087 + iter1)`);
   console.log(`Data:  ${DATA_DIR}`);
   console.log(`Dense: ${BGE_MODEL}`);
-  console.log(`RRF k: ${RRF_K}${RERANK ? `, rerank top-${RERANK_TOP_K}` : ''}`);
-
-  const corpus = loadJsonl(join(DATA_DIR, 'corpus.jsonl'));
+  console.log(`RRF k: ${RRF_K} (adaptive for corpus size ${corpus.length})${RERANK ? `, rerank top-${RERANK_TOP_K}` : ''}`);
+  console.log(`Normalization: min-max before RRF fusion`);
   const queries = loadJsonl(join(DATA_DIR, 'queries.jsonl'));
   const qrels = loadQrels(join(DATA_DIR, 'qrels/test.tsv'));
   console.log(`Corpus: ${corpus.length} docs · Test qrels: ${qrels.size}`);
@@ -162,18 +166,23 @@ async function main() {
     }
     bm25Scored.sort((a, b) => b.score - a.score);
 
-    // §3 — RRF fusion: score = sum over systems of 1/(k + rank).
-    // Only need top ~200 from each for stable RRF; cap at top-500 per system.
+    // §3 — RRF fusion: normalize scores first, then score = sum over systems of 1/(k + rank).
+    // Min-max normalize each system's scores to [0,1] for fair fusion (iter 1 optimization).
     const TOP_PER_SYSTEM = 500;
+    const denseTopK = denseScored.slice(0, Math.min(TOP_PER_SYSTEM, denseScored.length));
+    const bm25TopK = bm25Scored.slice(0, Math.min(TOP_PER_SYSTEM, bm25Scored.length)).filter((s) => s.score > 0);
+    const denseScoresNorm = minMaxNorm(denseTopK.map((s) => s.score));
+    const bm25ScoresNorm = minMaxNorm(bm25TopK.map((s) => s.score));
+    denseTopK.forEach((d, i) => { d.scoreNorm = denseScoresNorm[i]; });
+    bm25TopK.forEach((d, i) => { d.scoreNorm = bm25ScoresNorm[i]; });
+
     const rrfScores = new Map();
-    for (let r = 0; r < Math.min(TOP_PER_SYSTEM, denseScored.length); r++) {
-      const id = denseScored[r].id;
+    for (let r = 0; r < denseTopK.length; r++) {
+      const id = denseTopK[r].id;
       rrfScores.set(id, (rrfScores.get(id) || 0) + 1 / (RRF_K + r + 1));
     }
-    for (let r = 0; r < Math.min(TOP_PER_SYSTEM, bm25Scored.length); r++) {
-      const id = bm25Scored[r].id;
-      // Skip if this doc has 0 BM25 score (no token overlap) — true random docs would otherwise leak in
-      if (bm25Scored[r].score === 0) break;
+    for (let r = 0; r < bm25TopK.length; r++) {
+      const id = bm25TopK[r].id;
       rrfScores.set(id, (rrfScores.get(id) || 0) + 1 / (RRF_K + r + 1));
     }
     const fused = [...rrfScores.entries()]
