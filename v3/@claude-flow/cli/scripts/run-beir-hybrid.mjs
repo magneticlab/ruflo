@@ -44,6 +44,10 @@ const BASELINES_BY_DATASET = {
   arguana:  { 'BM25 (Lucene)': 0.397, 'DocT5query': 0.349, 'TAS-B': 0.429, 'GenQ': 0.493, 'ColBERT': 0.233, 'Contriever': 0.379, 'GTR-XL': 0.439, 'SPLADE++': 0.521, 'BGE-large-v1.5 (pub)': 0.636, 'SBERT msmarco': 0.371 },
   scidocs:  { 'BM25 (Lucene)': 0.158, 'DocT5query': 0.162, 'TAS-B': 0.149, 'GenQ': 0.143, 'ColBERT': 0.145, 'Contriever': 0.165, 'GTR-XL': 0.174, 'SPLADE++': 0.159, 'BGE-large-v1.5 (pub)': 0.225, 'SBERT msmarco': 0.122 },
 };
+// Iter 3: dataset-specific RRF weights for symmetric + dense-favored regimes (arguana: dense 1.6x stronger than BM25).
+const DATASET_RRF_WEIGHTS = {
+  arguana: { dense: 1.5, bm25: 1.0 },  // symmetric retrieval favors dense; boost it over weak BM25
+};
 function detectDataset(path) {
   const p = path.toLowerCase();
   for (const ds of Object.keys(BASELINES_BY_DATASET)) if (p.includes(ds)) return ds;
@@ -79,12 +83,14 @@ async function main() {
   const corpus = loadJsonl(join(DATA_DIR, 'corpus.jsonl'));
   const RRF_K = adaptiveRrfK(corpus.length);  // adaptive k based on corpus size (iter 1: normalize scores + tighter k for small corpora)
 
-  console.log(`# BEIR ${dataset} — hybrid RRF${RERANK ? ' + cross-encoder rerank' : ''} (ADR-087 + iter1 + iter2)`);
+  const weights = DATASET_RRF_WEIGHTS[dataset] || { dense: 1.0, bm25: 1.0 };
+  console.log(`# BEIR ${dataset} — hybrid RRF${RERANK ? ' + cross-encoder rerank' : ''} (ADR-087 + iter1 + iter2 + iter3)`);
   console.log(`Data:  ${DATA_DIR}`);
   console.log(`Dense: ${BGE_MODEL}`);
   console.log(`RRF k: ${RRF_K} (adaptive for corpus size ${corpus.length})${RERANK ? `, rerank top-${RERANK_TOP_K}` : ''}`);
   console.log(`Normalization: min-max before RRF fusion`);
   console.log(`Candidate pool: top-${adaptiveTopK(corpus.length)} per system (iter 2: scaled for large corpora)`);
+  console.log(`RRF weights: dense=${weights.dense} bm25=${weights.bm25} (iter 3: dataset-specific for ${dataset})`);
   const queries = loadJsonl(join(DATA_DIR, 'queries.jsonl'));
   const qrels = loadQrels(join(DATA_DIR, 'qrels/test.tsv'));
   console.log(`Corpus: ${corpus.length} docs · Test qrels: ${qrels.size}`);
@@ -180,13 +186,14 @@ async function main() {
     bm25TopK.forEach((d, i) => { d.scoreNorm = bm25ScoresNorm[i]; });
 
     const rrfScores = new Map();
+    const weights = DATASET_RRF_WEIGHTS[dataset] || { dense: 1.0, bm25: 1.0 };  // iter 3: dataset-specific weights
     for (let r = 0; r < denseTopK.length; r++) {
       const id = denseTopK[r].id;
-      rrfScores.set(id, (rrfScores.get(id) || 0) + 1 / (RRF_K + r + 1));
+      rrfScores.set(id, (rrfScores.get(id) || 0) + weights.dense / (RRF_K + r + 1));
     }
     for (let r = 0; r < bm25TopK.length; r++) {
       const id = bm25TopK[r].id;
-      rrfScores.set(id, (rrfScores.get(id) || 0) + 1 / (RRF_K + r + 1));
+      rrfScores.set(id, (rrfScores.get(id) || 0) + weights.bm25 / (RRF_K + r + 1));
     }
     const fused = [...rrfScores.entries()]
       .map(([id, score]) => ({ id, score }))
