@@ -1314,6 +1314,315 @@ async function activateControllerRegistry(
 }
 
 /**
+ * Self-heal an EXISTING memory database that is missing the `vector_indexes`
+ * table or per-namespace rows.
+ *
+ * Why this exists: fresh installs create `vector_indexes` + seed rows, but a
+ * DB written by an older CLI or by agentdb directly may have thousands of
+ * embedded rows in `memory_entries` and NO `vector_indexes` table at all.
+ * Two things break as a result:
+ *   1. The statusline's vector count read collapsed to `0` (the count query
+ *      referenced the missing table and failed whole — now split, but the
+ *      HNSW flag still needs the table).
+ *   2. #1941 — `memory_search` routes per namespace via `vector_indexes`; a
+ *      namespace with no row returns 0 results even when entries exist.
+ *
+ * This is idempotent and conservative:
+ *   - Does NOTHING (no writes) when the table already exists and every embedded
+ *     namespace already has a row — the common already-healed path, hit on
+ *     every MCP start, must not write to the live DB unnecessarily.
+ *   - Before ANY write, runs `PRAGMA quick_check`; if the DB reports structural
+ *     corruption it SKIPS the repair entirely (returns `corrupt:true`) rather
+ *     than writing into a malformed btree and risking making it worse. The
+ *     caller/user should recover via `sqlite3 old.db .recover | sqlite3 new.db`.
+ *   - Does NOT checkpoint. mode=ro readers already see committed WAL frames, and
+ *     forcing a checkpoint on a DB with a torn WAL could persist latent damage.
+ *
+ * When a repair IS needed and the DB is healthy: creates the table if absent,
+ * seeds the fresh-install default rows, and backfills an accurate
+ * `total_vectors` per namespace. Runs on the existing-DB path of
+ * `initializeMemoryDatabase` (MCP start / `memory init`) and from `ruflo init`.
+ *
+ * Uses better-sqlite3 (WAL-safe, native). If the native module is unavailable
+ * it is a silent no-op — the split statusline query already prevents the count
+ * from zeroing; only the HNSW flag and namespace routing stay degraded.
+ */
+/**
+ * Auto-recover a structurally-corrupt memory DB into a clean one, universally
+ * (better-sqlite3 only — no dependency on the external `sqlite3` CLI, which is
+ * absent on many npx hosts). Safe by construction:
+ *   1. Confirms corruption (quick_check) — no-op on a healthy DB.
+ *   2. Acquires an EXCLUSIVE lock (BEGIN IMMEDIATE). If another process is
+ *      writing, it SKIPS (returns reason:'writer-active') rather than racing a
+ *      writer and losing its in-flight writes — the mistake that must not recur.
+ *   3. Rebuilds a fresh DB table-by-table (schema + rows), skipping any single
+ *      table whose pages won't scan so one bad table can't abort the whole
+ *      rebuild.
+ *   4. VERIFIES the rebuild (integrity_check == ok AND recovered
+ *      memory_entries count >= the readable source count) BEFORE touching the
+ *      original.
+ *   5. Backs up the corrupt DB to `<db>.corrupt-<ts>.bak`, then atomically
+ *      renames the verified rebuild into place and drops stale -wal/-shm.
+ * On any failure the original + backup are left intact — never destructive.
+ */
+export async function recoverMemoryDatabase(
+  dbPath: string,
+  opts: { verbose?: boolean } = {},
+): Promise<{ recovered: boolean; backupPath?: string; rows?: number; reason?: string }> {
+  if (!dbPath || !fs.existsSync(dbPath)) return { recovered: false, reason: 'no-db' };
+
+  let Database: any;
+  try {
+    // Module name behind a variable so TS does not statically resolve the
+    // optional native dep's types at build time (CI may not install them).
+    const mod: string = 'better-sqlite3';
+    Database = (await import(mod)).default;
+  } catch {
+    return { recovered: false, reason: 'no-native' };
+  }
+
+  const ts = Date.now();
+  const tmpPath = `${dbPath}.recovering-${ts}`;
+  const bakPath = `${dbPath}.corrupt-${ts}.bak`;
+  let src: any;
+  let dst: any;
+
+  try {
+    src = new Database(dbPath, { timeout: 1500 });
+
+    // Confirm corruption — never rewrite a healthy DB.
+    const qc = src.prepare('PRAGMA quick_check(1)').get() as Record<string, string> | undefined;
+    const qcVal = qc ? String(Object.values(qc)[0] ?? '') : '';
+    if (qcVal.toLowerCase() === 'ok') { src.close(); return { recovered: false, reason: 'not-corrupt' }; }
+
+    // Exclusive-writer guard: acquire the write lock. If busy, another process
+    // is writing — do NOT race it. Reading within this txn is still allowed.
+    try {
+      src.exec('BEGIN IMMEDIATE');
+    } catch {
+      src.close();
+      return { recovered: false, reason: 'writer-active' };
+    }
+
+    let srcRows = 0;
+    try { srcRows = (src.prepare('SELECT COUNT(*) AS c FROM memory_entries').get() as { c: number })?.c ?? 0; } catch { /* unreadable */ }
+
+    try { fs.rmSync(tmpPath, { force: true }); } catch { /* fresh */ }
+    dst = new Database(tmpPath);
+
+    // Copy schema: tables first (so data can be inserted), then indexes/triggers.
+    const objects = src
+      .prepare("SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'")
+      .all() as Array<{ type: string; name: string; sql: string }>;
+    const tables = objects.filter(o => o.type === 'table');
+    const others = objects.filter(o => o.type !== 'table');
+
+    for (const t of tables) {
+      try { dst.exec(t.sql); } catch { /* skip an untranslatable table def */ }
+    }
+
+    // Copy rows table-by-table; a table whose pages won't scan is skipped whole.
+    let copiedEntries = 0;
+    for (const t of tables) {
+      try {
+        const cols = (dst.prepare(`PRAGMA table_info("${t.name}")`).all() as Array<{ name: string }>).map(c => c.name);
+        if (!cols.length) continue;
+        const colList = cols.map(c => `"${c}"`).join(',');
+        const placeholders = cols.map(() => '?').join(',');
+        const insert = dst.prepare(`INSERT OR IGNORE INTO "${t.name}" (${colList}) VALUES (${placeholders})`);
+        const rows = src.prepare(`SELECT ${colList} FROM "${t.name}"`).all() as Array<Record<string, unknown>>;
+        const runAll = dst.transaction((rs: Array<Record<string, unknown>>) => {
+          for (const r of rs) insert.run(cols.map(c => r[c] as any));
+        });
+        runAll(rows);
+        if (t.name === 'memory_entries') copiedEntries = rows.length;
+      } catch { /* skip a table whose data pages are unreadable */ }
+    }
+
+    for (const o of others) {
+      try { dst.exec(o.sql); } catch { /* an index over corrupt data — non-fatal */ }
+    }
+
+    dst.close(); dst = null;
+    try { src.exec('ROLLBACK'); } catch { /* ignore */ }
+    src.close(); src = null;
+
+    // Verify BEFORE touching the original.
+    const check = new Database(tmpPath, { readonly: true });
+    const integ = String(check.pragma('integrity_check', { simple: true }) ?? '');
+    let dstRows = 0;
+    try { dstRows = (check.prepare('SELECT COUNT(*) AS c FROM memory_entries').get() as { c: number })?.c ?? 0; } catch { /* */ }
+    check.close();
+
+    if (integ.toLowerCase() !== 'ok' || dstRows < srcRows) {
+      try { fs.rmSync(tmpPath, { force: true }); } catch { /* */ }
+      if (opts.verbose) {
+        console.log(`memory DB auto-recovery aborted (integrity=${integ}, rows ${dstRows}/${srcRows}) — original untouched`);
+      }
+      return { recovered: false, reason: 'verify-failed' };
+    }
+
+    // Back up the corrupt DB, then atomically swap in the verified rebuild.
+    fs.copyFileSync(dbPath, bakPath);
+    fs.renameSync(tmpPath, dbPath);
+    for (const s of ['-wal', '-shm']) { try { fs.rmSync(`${dbPath}${s}`, { force: true }); } catch { /* */ } }
+
+    if (opts.verbose) {
+      console.log(`memory DB auto-recovered: ${dstRows} rows, integrity ok. Corrupt original saved to ${bakPath}`);
+    }
+    return { recovered: true, backupPath: bakPath, rows: dstRows };
+  } catch (e) {
+    try { dst?.close(); } catch { /* */ }
+    try { src?.exec('ROLLBACK'); } catch { /* */ }
+    try { src?.close(); } catch { /* */ }
+    try { fs.rmSync(tmpPath, { force: true }); } catch { /* */ }
+    if (opts.verbose) console.log(`memory DB auto-recovery error: ${(e as Error)?.message ?? e}`);
+    return { recovered: false, reason: 'error' };
+  }
+}
+
+export async function repairVectorIndexes(
+  dbPath: string,
+  opts: { verbose?: boolean; autoRecover?: boolean } = {},
+): Promise<{ repaired: boolean; tableCreated: boolean; namespaces: string[]; corrupt?: boolean; recovered?: boolean; backupPath?: string }> {
+  const res = { repaired: false, tableCreated: false, namespaces: [] as string[], corrupt: false };
+  if (!dbPath || !fs.existsSync(dbPath)) return res;
+
+  let Database: any;
+  try {
+    // Module name behind a variable so TS does not statically resolve the
+    // optional native dep's types at build time (CI may not install them).
+    const mod: string = 'better-sqlite3';
+    Database = (await import(mod)).default;
+  } catch {
+    // Native module absent (e.g. WASM-only host). Statusline fix still covers
+    // the display; nothing to repair here.
+    return res;
+  }
+
+  let db: any;
+  try {
+    db = new Database(dbPath, { timeout: 3000 });
+
+    const tableExists = (name: string): boolean =>
+      (db.prepare("SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name=?").get(name)?.c ?? 0) > 0;
+
+    // Nothing to key off if there is no entries table.
+    if (!tableExists('memory_entries')) { db.close(); return res; }
+
+    const hasVectorIndexes = tableExists('vector_indexes');
+
+    // Namespaces that actually have embeddings.
+    const nsRows = db
+      .prepare(
+        "SELECT COALESCE(namespace, 'default') AS ns, COUNT(*) AS c " +
+        'FROM memory_entries WHERE embedding IS NOT NULL GROUP BY ns',
+      )
+      .all() as Array<{ ns: string; c: number }>;
+
+    // Which of those are already present in vector_indexes? If the table exists
+    // and every embedded namespace already has a row, the DB is already healed
+    // — return WITHOUT writing anything (common path on every MCP start).
+    let needsWrite = !hasVectorIndexes;
+    if (hasVectorIndexes) {
+      const present = new Set(
+        (db.prepare('SELECT name FROM vector_indexes').all() as Array<{ name: string }>).map(r => r.name),
+      );
+      needsWrite = nsRows.some(r => !present.has(String(r.ns || 'default')));
+    }
+    if (!needsWrite) { db.close(); return res; }
+
+    // A write is needed. GUARD: never write into a structurally corrupt DB —
+    // that risks worsening the damage. quick_check is cheaper than a full
+    // integrity_check and only runs on the rare repair path, not every start.
+    const qc = db.prepare('PRAGMA quick_check(1)').get() as Record<string, string> | undefined;
+    const qcVal = qc ? String(Object.values(qc)[0] ?? '') : '';
+    if (qcVal.toLowerCase() !== 'ok') {
+      res.corrupt = true;
+      db.close(); // release our handle before recovery may swap the file
+      if (opts.autoRecover) {
+        // Auto-fix: rebuild the corrupt DB (backup + verify + atomic swap), then
+        // provision vector_indexes on the clean rebuild. This is what makes any
+        // npx-deployed ruflo self-repair a corrupt memory DB on init / MCP start.
+        const rec = await recoverMemoryDatabase(dbPath, { verbose: opts.verbose });
+        if (rec.recovered) {
+          const healed = await repairVectorIndexes(dbPath, { verbose: opts.verbose });
+          return { ...healed, corrupt: true, recovered: true, backupPath: rec.backupPath };
+        }
+        if (opts.verbose) {
+          console.log(`vector_indexes repair skipped — corruption (${qcVal}); auto-recovery not run (${rec.reason ?? 'unknown'})`);
+        }
+      } else if (opts.verbose) {
+        console.log(
+          'vector_indexes repair SKIPPED — memory DB reports corruption (' + qcVal + '). ' +
+          'Recover with:  sqlite3 <db> .recover | sqlite3 <db>.recovered',
+        );
+      }
+      return res;
+    }
+
+    if (!hasVectorIndexes) {
+      db.exec(`CREATE TABLE IF NOT EXISTS vector_indexes (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        dimensions INTEGER NOT NULL,
+        metric TEXT DEFAULT 'cosine' CHECK(metric IN ('cosine', 'euclidean', 'dot')),
+        hnsw_m INTEGER DEFAULT 16,
+        hnsw_ef_construction INTEGER DEFAULT 200,
+        hnsw_ef_search INTEGER DEFAULT 100,
+        quantization_type TEXT CHECK(quantization_type IN ('none', 'scalar', 'product')),
+        quantization_bits INTEGER DEFAULT 8,
+        total_vectors INTEGER DEFAULT 0,
+        last_rebuild_at INTEGER,
+        created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
+        updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
+      )`);
+      res.tableCreated = true;
+    }
+
+    // 384 = default ONNX model dim (Xenova/all-MiniLM-L6-v2); HNSW rejects
+    // dim-mismatched inserts, so this must match the stored embeddings (#1947).
+    const ensureRow = db.prepare(
+      'INSERT OR IGNORE INTO vector_indexes (id, name, dimensions) VALUES (?, ?, 384)',
+    );
+    const setCount = db.prepare(
+      'UPDATE vector_indexes SET total_vectors = ?, updated_at = ? WHERE name = ?',
+    );
+
+    const backfill = db.transaction(() => {
+      // Parity with a fresh install's seed rows.
+      ensureRow.run('default', 'default');
+      ensureRow.run('patterns', 'patterns');
+
+      const now = Date.now();
+      for (const r of nsRows) {
+        const ns = String(r.ns || 'default');
+        ensureRow.run(ns, ns);
+        setCount.run(r.c, now, ns);
+        res.namespaces.push(ns);
+      }
+    });
+    backfill();
+
+    res.repaired = res.tableCreated || res.namespaces.length > 0;
+    db.close();
+
+    if (opts.verbose && res.repaired) {
+      console.log(
+        `vector_indexes ${res.tableCreated ? 'created' : 'refreshed'} — ` +
+        `backfilled ${res.namespaces.length} namespace(s)`,
+      );
+    }
+  } catch (e) {
+    try { db?.close(); } catch { /* already closed */ }
+    if (opts.verbose) {
+      console.log(`vector_indexes repair skipped: ${(e as Error)?.message ?? e}`);
+    }
+  }
+  return res;
+}
+
+/**
  * Initialize the memory database properly using sql.js
  */
 export async function initializeMemoryDatabase(options: {
@@ -1357,19 +1666,24 @@ export async function initializeMemoryDatabase(options: {
     // surfaced an `[ERROR]` and a "Initialization failed" spinner even when
     // the existing DB was perfectly healthy.
     if (fs.existsSync(dbPath) && !force) {
+      // #2568-followup: an existing DB may predate `vector_indexes` (or was
+      // written by agentdb directly). Self-heal it here — this branch is hit on
+      // every MCP-server start and `memory init`, so any ruflo repairs itself.
+      // Idempotent + best-effort; never turns a healthy re-init into a failure.
+      const heal = await repairVectorIndexes(dbPath, { verbose, autoRecover: true });
       return {
         success: true,
         alreadyExists: true,
         backend,
         dbPath,
         schemaVersion: '3.0.0',
-        tablesCreated: [],
+        tablesCreated: heal.tableCreated ? ['vector_indexes'] : [],
         indexesCreated: [],
         features: {
           vectorEmbeddings: false,
           patternLearning: false,
           temporalDecay: false,
-          hnswIndexing: false,
+          hnswIndexing: heal.repaired,
           migrationTracking: false
         }
       };
